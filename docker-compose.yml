@@ -1,0 +1,196 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: email-platform-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: emailuser
+      POSTGRES_PASSWORD: emailpass
+      POSTGRES_DB: emailplatform
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - email-platform-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U emailuser -d emailplatform"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache & Queue
+  redis:
+    image: redis:7-alpine
+    container_name: email-platform-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - email-platform-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Postfix SMTP Server
+  postfix:
+    image: boky/postfix:latest
+    container_name: email-platform-postfix
+    restart: unless-stopped
+    environment:
+      POSTFIX_myhostname: mail.localhost
+      POSTFIX_mydestination: localhost
+      POSTFIX_mynetworks: 0.0.0.0/0
+      POSTFIX_smtpd_tls_security_level: may
+      POSTFIX_smtp_tls_security_level: may
+      ALLOWED_SENDER_DOMAINS: localhost
+    volumes:
+      - postfix_data:/var/spool/postfix
+    ports:
+      - "25:25"
+      - "587:587"
+      - "465:465"
+    networks:
+      - email-platform-network
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: email-platform-backend
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://emailuser:emailpass@postgres:5432/emailplatform
+      - REDIS_URL=redis://redis:6379/0
+      - SMTP_HOST=postfix
+      - SMTP_PORT=587
+      - SECRET_KEY=${SECRET_KEY:-your-super-secret-key-change-in-production}
+      - JWT_SECRET=${JWT_SECRET:-jwt-secret-key-change-in-production}
+      - DEBUG=${DEBUG:-false}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - /app/__pycache__
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postfix:
+        condition: service_started
+    networks:
+      - email-platform-network
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Email Worker
+  email-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: email-platform-email-worker
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://emailuser:emailpass@postgres:5432/emailplatform
+      - REDIS_URL=redis://redis:6379/0
+      - SMTP_HOST=postfix
+      - SMTP_PORT=587
+      - SECRET_KEY=${SECRET_KEY:-your-super-secret-key-change-in-production}
+      - JWT_SECRET=${JWT_SECRET:-jwt-secret-key-change-in-production}
+    volumes:
+      - ./backend:/app
+      - /app/__pycache__
+    depends_on:
+      - postgres
+      - redis
+      - postfix
+    networks:
+      - email-platform-network
+    command: python -m workers.email_worker
+
+  # Campaign Worker
+  campaign-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: email-platform-campaign-worker
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://emailuser:emailpass@postgres:5432/emailplatform
+      - REDIS_URL=redis://redis:6379/0
+      - SMTP_HOST=postfix
+      - SMTP_PORT=587
+      - SECRET_KEY=${SECRET_KEY:-your-super-secret-key-change-in-production}
+      - JWT_SECRET=${JWT_SECRET:-jwt-secret-key-change-in-production}
+    volumes:
+      - ./backend:/app
+      - /app/__pycache__
+    depends_on:
+      - postgres
+      - redis
+      - postfix
+    networks:
+      - email-platform-network
+    command: python -m workers.campaign_worker
+
+  # Bounce Worker
+  bounce-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: email-platform-bounce-worker
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://emailuser:emailpass@postgres:5432/emailplatform
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-your-super-secret-key-change-in-production}
+      - JWT_SECRET=${JWT_SECRET:-jwt-secret-key-change-in-production}
+    volumes:
+      - ./backend:/app
+      - /app/__pycache__
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - email-platform-network
+    command: python -m workers.bounce_worker
+
+  # Frontend (Next.js)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: email-platform-frontend
+    restart: unless-stopped
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1
+      - NEXT_PUBLIC_TRACKING_DOMAIN=localhost
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      - backend
+    networks:
+      - email-platform-network
+    command: npm run dev
+
+volumes:
+  postgres_data:
+  redis_data:
+  postfix_data:
+
+networks:
+  email-platform-network:
+    driver: bridge
